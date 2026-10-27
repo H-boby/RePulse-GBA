@@ -1,0 +1,1 @@
+SELFTEST_OK frames=1800 crc=DED11DB8 avg_ms_per_frame=1.820 fps=549.3 audio=opened at 44100 Hz peak_rss_mb=11.0 total_ms=3630
