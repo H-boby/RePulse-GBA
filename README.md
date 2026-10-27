@@ -1,0 +1,274 @@
+# gba-desktop
+
+A small, native Game Boy Advance emulator launcher for Windows 10 x64, built for
+low-end PCs: fast startup, low CPU and memory use, no telemetry, no background
+services, no runtime dependencies. The emulation core is
+[mGBA](https://mgba.io) 0.10.5 (MPL-2.0), vendored and statically linked.
+
+The launcher can also **package itself plus one ROM into a single standalone
+EXE** and run **deterministic TCP netplay** between two machines (see
+[Netplay](#netplay) for the honest limits of that).
+
+---
+
+## Features
+
+* Open/validate `.gba` ROMs, play in a resizable window or fullscreen (Alt+Enter)
+* Battery saves (SRAM / Flash / EEPROM via mGBA), save states (F5 / F7)
+* Keyboard and USB gamepad input, remappable in Settings
+* Audio (SDL2 queue mode), frame pacing locked to the GBA's 59.7275 Hz
+* Standalone EXE builder: app + ROM appended as a compressed payload,
+  verified at build time and at launch; saves stay in external files
+* Netplay: host/join over TCP with ROM-CRC handshake, per-frame input
+  exchange, configurable input delay, CRC32 desync detection, ping display
+* Headless CLI modes for automation (`--play`, `--selftest`, `--netplay-test`)
+* Everything statically linked: only Windows system DLLs remain
+
+Requirements (build)
+
+Tested with exactly these versions on Windows 10 x64 (MSYS2 MinGW-w64):
+
+| Tool | Version used |
+|---|---|
+| MSYS2 (mingw64 shell) | current |
+| GCC/G++ (MinGW-w64) | 16.2.0 |
+| CMake | 4.4.4 (needs >= 3.20) |
+| Ninja | any recent |
+| Python 3 | for generating the original test ROMs only |
+| Packages | `mingw-w64-x86_64-{gcc,cmake,ninja,pkgconf,SDL2,zlib}` |
+
+Install them inside the mingw64 shell:
+
+```sh
+pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake \
+                   mingw-w64-x86_64-ninja mingw-w64-x86_64-pkgconf \
+                   mingw-w64-x86_64-SDL2 mingw-w64-x86_64-zlib python
+```
+
+`third_party/mgba` is already vendored in this repository (shallow clone of
+tag `0.10.5`); no network access is needed to build.
+
+ Building
+
+From the repository root, in a **mingw64** shell:
+
+```sh
+export PATH=/c/msys64/mingw64/bin:$PATH
+cmake -S gba-desktop -B gba-desktop/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build gba-desktop/build -j $(nproc)
+```
+
+Outputs (in `gba-desktop/build/`):
+
+* `gba-desktop.exe` – the launcher (also plays, builds standalone EXEs, hosts/joins netplay)
+* `gbadesk_tests.exe` – the test suite
+* `testroms/testrom_a.gba`, `testrom_b.gba` – generated original test ROMs
+
+ Running
+
+```sh
+cd gba-desktop/build
+./gba-desktop.exe                      # launcher window
+./gba-desktop.exe game.gba             # launcher with that ROM pre-selected
+./gba-desktop.exe --play --rom game.gba # play directly, no launcher
+./gba-desktop.exe --help
+```
+
+**Controls (defaults, remappable in Settings):** Arrow keys = D-pad,
+`X` = A, `Z` = B, `A` = L, `S` = R, Enter = Start, Right Shift = Select.
+`Alt+Enter` fullscreen, `F5` save state (slot 1), `F7` load state,
+`F11` disconnect netplay and continue solo, `Esc` quit.
+
+**Where things are stored:**
+
+| What | Location |
+|---|---|
+| Settings | `gba-desktop.ini` next to `gba-desktop.exe` |
+| Battery saves | `<exe>\saves\` if writable, else `%LOCALAPPDATA%\GBA Desktop\saves\` |
+| Save states | `<exe>\states\` (same fallback), files `name.ss1` |
+| Log file | `%LOCALAPPDATA%\GBA Desktop\gba-desktop.log` |
+| Extracted bundled ROMs | `%LOCALAPPDATA%\GBA Desktop\standalone\` |
+
+The log file receives every status line even when there is no console
+attached — check it first when something misbehaves.
+
+ Standalone EXE builder
+
+Press **Build Standalone EXE** in the launcher (or see
+`src/standalone_builder.cpp`), pick a ROM and an output path. The builder:
+
+1. validates the ROM, compresses it (zlib level 6),
+2. appends `[compressed ROM][manifest][64-byte footer]` to a copy of
+   `gba-desktop.exe` (written to a temp file, then renamed),
+3. re-reads and CRC-verifies the payload from disk,
+4. parses the PE import table and flags any non-system DLL,
+5. launches the generated EXE with `--selftest`, which boots the *bundled*
+   ROM and must report `SELFTEST_OK`.
+
+Output location is whatever you chose; progress is reported per cent.
+
+At runtime the EXE detects its own footer, extracts the ROM to
+`%LOCALAPPDATA%\GBA Desktop\standalone\` (CRC-checked, cached) and boots it.
+**Save files are never inside the EXE** — they live in the save directories
+above, so rebuilding or replacing the EXE does not lose progress.
+
+Remaining dependencies of the generated EXE: Windows system DLLs only
+(`ADVAPI32, COMCTL32, COMDLG32, GDI32, IMM32, KERNEL32, msvcrt, OLE32,
+OLEAUT32, SETUPAPI, SHELL32, SHLWAPI, USER32, VERSION, WINMM, WS2_32` —
+the verified import list from the test run). No Visual C++ redist, no SDL2.dll,
+no Python, no installer.
+
+**Legal:** only bundle ROMs you own and are entitled to distribute. Nothing
+copyrighted ships with this application; the test ROMs are generated by
+`tools/make_test_rom.py` from scratch.
+
+ Netplay
+
+Host Room listens on a TCP port; Join Room connects to `IP:port`. Both sides
+must run the **same ROM** (checked by CRC-32 and size during the handshake;
+mismatch exits with code 4 on both sides).
+
+Protocol (see `src/netplay/`): length-prefixed messages over TCP —
+`Hello/HelloAck` (version, ROM CRC/size, title, game code), `Input`
+(frame-stamped buttons), `Hash` (every 60 frames: CRC-32 of the serialized
+machine state for desync detection), `Ping/Pong`, `Bye`. Lockstep: each side
+simulates frame *N* only after both inputs for *N* arrive; the local input is
+applied `input delay` frames late (default 3, configurable 0–10) to hide
+latency. Frame pacing stays on the audio clock while waiting.
+
+**Read these limits before using it:**
+
+* This is **not** link-cable emulation. mGBA 0.10.5 has no networked link
+  play (upstream tracks it for 0.12.0, issue #2379), so both peers emulate
+  **one shared game instance** and OR their inputs together
+  (shared-control co-op). It does **not** emulate two GBAs connected by a
+  cable.
+* **Pokémon trading/battling and any GBA link-feature are NOT supported**
+  and have not been tested. Do not expect them to work.
+* Both peers must run byte-identical ROMs, or the handshake refuses.
+* Games with a real-time clock (RTC, e.g. some Pokémon titles) or other
+  wall-clock/randomness sources may diverge; desync is detected (CRC
+  mismatch) and reported, then the session stops — it is not silently hidden.
+* Ordinary latency: TCP on the public internet exposes you to host-port
+  risks (open only your chosen port, to people you trust; this protocol has
+  no authentication and nothing in it executes commands or accesses files).
+  For remote players, a VPN or port-forwarded router with a firewall rule
+  limited to one port is the sane setup. Expect ~one input-delay plus RTT of
+  perceived lag; increase input delay if your link is jittery.
+
+CLI: `--netplay-test <host|client> <ip> <port> <frames> --rom <path> [--delay N]`
+with exit codes `0` ok, `2` desync, `3` connect failure, `4` ROM mismatch,
+`5` ROM/core failure — used by the automated tests.
+
+Testing
+
+```sh
+cd gba-desktop/build
+ctest --output-on-failure
+```
+
+Nine suites, all passing on the target machine (~19 s total):
+
+| Suite | What it verifies |
+|---|---|
+| `unit` | ROM validation (empty/truncated/bad entry/logo/oversize/header-checksum), wire protocol framing, settings round-trip incl. non-ASCII paths |
+| `rom_validation` | same ROM checks isolated |
+| `protocol` | message encode/decode/fragmentation |
+| `config_roundtrip` | INI persistence |
+| `standalone_build` | builds a real standalone EXE, checks footer/manifest, CRC round-trip, PE imports contain only system DLLs, launches it and requires `SELFTEST_OK` |
+| `core_determinism` | same seed ⇒ identical state CRC; different input seed ⇒ different state; save-state round-trip; framebuffer actually renders |
+| `app_selftest` | `--selftest`: 3×600 frames headless, determinism, input sensitivity, fps/RSS reporting |
+| `netplay_loopback` | two real processes, 300 frames lockstep over loopback TCP |
+| `netplay_failures` | closed port ⇒ 3 fast, invalid IP ⇒ 3 fast, ROM mismatch ⇒ 4 on both sides, peer leaving ⇒ 3 (run 8× in a row to check stability) |
+
+Not verified: real link-cable games (unsupported by design), commercial ROMs
+(no copyrighted test material), audio *content* (device opens and paces
+correctly; nobody has listened to it on this machine), gamepad hot-plug,
+fullscreen on multi-monitor setups.
+
+## Measured performance
+
+All numbers below were measured on the **target hardware**: Intel Celeron
+4205U @ 1.80 GHz (2C/2T), Intel UHD 610, 3.9 GB RAM, Windows 10 x64, HDD.
+Test ROMs are the synthetic ones from `tools/`; heavier commercial games were
+not measured (no copyrighted material available).
+
+| Metric | Result | Method |
+|---|---|---|
+| Windowed, audio-paced frame rate | **59.7 fps average over 30 s** (target 59.7275) | `--play` run, `session ended:` log line, 1865 frames |
+| Per-frame emulation cost | 1.31 ms (capacity ≈ 760 fps) | same run |
+| Headless, unpaced | 1.62 ms/frame ≈ 615 fps | `--selftest`, 1800 frames |
+| CPU, windowed 30 s | 10.8 % of one core | `TotalProcessorTime` delta |
+| Working set, windowed | 51 MiB (peak RSS 59.8 MiB) | same run |
+| Launcher window appears | 0.3–1.6 s (warm start ~0.4 s) | process spawn → main-window handle |
+| Full test suite | 9/9 pass, ~19 s | ctest |
+
+Honest caveats: per-second fps windows in the title bar oscillate roughly
+58–62 while the audio-queue sawtooth settles; the session average is what
+the numbers above report. Commercial games were not benchmarked, so no
+per-title frame rate is claimed. Nothing here guarantees full speed in every
+game.
+
+## Troubleshooting
+
+* **`gba-desktop.exe` does not start** — it is fully static; a missing-DLL
+  dialog means the file is corrupt or truncated. Check
+  `%LOCALAPPDATA%\GBA Desktop\gba-desktop.log`.
+* **CMake/configure errors** — CMake < 3.20 unsupported; if `third_party/mgba`
+  reports missing optional features (epoxy, libelf) that is expected (no GL
+  frontend is built). If a stale `build/CMakeCache.txt` confuses things,
+  delete `build/` and reconfigure.
+* **Link error `multiple definition of crc32`** — zlib vs mGBA's bundled
+  fallback. The project CMake seeds `CMAKE_REQUIRED_LIBRARIES` so mGBA
+  detects and uses zlib's `crc32`; if you override toolchain zlib paths,
+  make sure `pkg-config zlib` still resolves.
+* **ROM rejected** — messages are explicit: too small (header is 196 bytes),
+  byte 3 not an ARM branch (`0xEA`), byte `0xB2` not `0x96`, larger than the
+  32 MiB cart address space, or not a file mGBA recognises. A bad header
+  *checksum* is only a warning and still loads.
+* **No sound / "audio disabled for this session"** — check the log line from
+  `SDL_OpenAudioDevice`; another exclusive-mode app may hold the device.
+  Try another sample rate (22050/32000/44100/48000) or a larger buffer in
+  Settings.
+* **Netplay cannot connect** — host must allow inbound TCP on the chosen port
+  through Windows Defender Firewall (`netsh advfirewall` rule or the prompt).
+  Both sides need the identical ROM. Exit codes: 3 = couldn't connect/peer
+  lost, 4 = ROM mismatch, 2 = desync detected.
+* **Slow emulation** — see the log's `session ended:` line for the real
+  ms/frame. Close background programs on such a small machine; the emulation
+  itself measured 1.3 ms/frame here.
+
+## Project layout
+
+```
+gba-desktop/
+├── CMakeLists.txt          build: mGBA (vendored) + SDL2/zlib static, app, tests
+├── LICENSE / LICENSES/     MIT for our code; MPL-2.0, zlib texts for deps
+├── src/
+│   ├── main.cpp            entry point, CLI modes, payload autostart
+│   ├── app.{h,cpp}         Win32 launcher UI, settings dialog, status log
+│   ├── config.{h,cpp}      settings model + INI persistence
+│   ├── rom_loader.{h,cpp}  ROM reading/validation (mGBA-compatible checks)
+│   ├── emulator_core.{h,cpp} mGBA (mCore) wrapper: load, run, saves, states
+│   ├── video.{h,cpp}       SDL window/renderer/texture present
+│   ├── input.{h,cpp}       keyboard + gamepad via SDL scancodes
+│   ├── audio.{h,cpp}       SDL queue-mode audio, device-rate aware
+│   ├── save_manager.{h,cpp} save/state directory resolution
+│   ├── session.{h,cpp}     frame loop, pacing, headless & netplay drivers
+│   ├── util.{h,cpp}        paths, files, logging, CRC-32, timing
+│   ├── netplay/            protocol.{h,cpp} + netplay.{h,cpp} (TCP session)
+│   └── standalone_builder.{h,cpp} payload format, PE import scan, self-test
+├── tools/make_test_rom.py  generates the original test ROMs
+├── tests/                  unit + integration suites (ctest)
+├── third_party/mgba/       mGBA 0.10.5 (MPL-2.0), vendored
+└── assets/version.rc       Windows version resource
+```
+
+Licenses
+
+* This application's own code: MIT (see `LICENSE`).
+* mGBA 0.10.5: MPL-2.0 (`LICENSES/mGBA-MPL-2.0.txt`), vendored unmodified
+  under `third_party/mgba/`. Statically linked; MPL obligations cover the
+  mGBA source files themselves, which are available in that directory.
+* SDL2 and zlib: zlib license (`LICENSES/SDL2-zlib.txt`, `LICENSES/zlib.txt`).
+* No other dependencies are shipped. No telemetry, no ads, no update service.
